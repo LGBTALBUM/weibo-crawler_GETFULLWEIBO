@@ -730,6 +730,80 @@ class Weibo(object):
                 f.write(error_entry.encode(sys.stdout.encoding))
             logger.exception(e)
 
+    def fetch_full_text(self, weibo_id):
+        """
+        尝试四路拿长微博全文，返回纯文本：
+         1) PC AJAX /ajax/statuses/longtext
+         2) 移动端 /api/statuses/extend
+         3) 移动端 /statuses/show
+         4) detail 页 __INITIAL_STATE__
+        """
+        # 公用 headers
+        base_headers = {
+            **self.headers,
+            'Referer': f'https://m.weibo.cn/detail/{weibo_id}'
+        }
+
+        # 1) PC AJAX 接口
+        try:
+            url_pc = f"https://weibo.com/ajax/statuses/longtext?id={weibo_id}"
+            headers_pc = {
+                **base_headers,
+                'Referer': 'https://weibo.com/',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Accept': 'application/json, text/plain, */*'
+            }
+            r = self.session.get(url_pc, headers=headers_pc, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            html = j.get('data', {}).get('longTextContent', '')
+            if html:
+                return etree.HTML(html).xpath("string(.)").strip()
+        except (HTTPError, JSONDecodeError):
+            pass
+
+        # 2) 移动端 extend 接口
+        try:
+            url_ext = f"https://m.weibo.cn/api/statuses/extend?id={weibo_id}"
+            r = self.session.get(url_ext, headers=base_headers, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            html = j.get('data', {}).get('longTextContent', '')
+            if html:
+                return etree.HTML(html).xpath("string(.)").strip()
+        except (HTTPError, JSONDecodeError):
+            pass
+
+        # 3) 移动端 show 接口
+        try:
+            url_show = f"https://m.weibo.cn/statuses/show?id={weibo_id}"
+            r = self.session.get(url_show, headers=base_headers, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            html = j.get('data', {}).get('text', '')
+            if html:
+                return etree.HTML(html).xpath("string(.)").strip()
+        except (HTTPError, JSONDecodeError):
+            pass
+
+        # 4) 退到 detail 页面埋点 JSON
+        try:
+            detail = self.session.get(f"https://m.weibo.cn/detail/{weibo_id}",
+                                      headers=base_headers, timeout=10)
+            detail.raise_for_status()
+            m = re.search(r"window\.__INITIAL_STATE__\s*=\s*({.*?});", detail.text)
+            if m:
+                state = json.loads(m.group(1))
+                status = state.get("status", {})
+                html = status.get("text", "")
+                if html:
+                    return etree.HTML(html).xpath("string(.)").strip()
+        except Exception:
+            pass
+
+        # 全都失败，退回空串
+        return ""
+
     def sqlite_exist_file(self, url):
         if not os.path.exists(self.get_sqlte_path()):
             return True
@@ -962,6 +1036,11 @@ class Weibo(object):
         return weibo
 
     def parse_weibo(self, weibo_info):
+        # weibo = OrderedDict()
+        # 如果上游没拿到任何数据，就直接跳过
+        if weibo_info is None:
+            logger.warning("parse_weibo 收到 None，跳过这一条")
+            return {}
         weibo = OrderedDict()
         if weibo_info["user"]:
             weibo["user_id"] = weibo_info["user"]["id"]
@@ -1061,47 +1140,52 @@ class Weibo(object):
         logger.info("-" * 120)
 
     def get_one_weibo(self, info):
-        """获取一条微博的全部信息"""
-        try:
-            weibo_info = info["mblog"]
-            weibo_id = weibo_info["id"]
-            retweeted_status = weibo_info.get("retweeted_status")
-            is_long = (
-                True if weibo_info.get("pic_num") > 9 else weibo_info.get("isLongText")
-            )
-            if retweeted_status and retweeted_status.get("id"):  # 转发
-                retweet_id = retweeted_status.get("id")
-                is_long_retweet = retweeted_status.get("isLongText")
-                if is_long:
-                    weibo = self.get_long_weibo(weibo_id)
-                    if not weibo:
-                        weibo = self.parse_weibo(weibo_info)
-                else:
-                    weibo = self.parse_weibo(weibo_info)
-                if is_long_retweet:
-                    retweet = self.get_long_weibo(retweet_id)
-                    if not retweet:
-                        retweet = self.parse_weibo(retweeted_status)
-                else:
-                    retweet = self.parse_weibo(retweeted_status)
-                (
-                    retweet["created_at"],
-                    retweet["full_created_at"],
-                ) = self.standardize_date(retweeted_status["created_at"])
+        """
+        :info: 原始 API 返回的一个 card dict
+        返回处理好的 weibo dict，若解析失败或内容为空则返回 None
+        """
+        # 1. 拿到 mblog 部分
+        mblog = info.get("mblog")
+        if not isinstance(mblog, dict):
+            # 无效条目，跳过
+            return None
+    
+        weibo_id = mblog.get("id")
+        if not weibo_id:
+            return None
+    
+        weibo = self.parse_weibo(mblog)
+    
+        # 如果是长文，尝试用 fetch_full_text 拿纯文本
+        if mblog.get("isLongText"):
+            full = self.fetch_full_text(weibo_id)
+            if full and len(full) > len(weibo["text"]):
+                weibo["text"] = full
+    
+        # 3. 再处理转发部分
+        retweeted = mblog.get("retweeted_status")
+        if isinstance(retweeted, dict) and retweeted.get("id"):
+            retweet_id = retweeted["id"]
+            is_long_rt = bool(retweeted.get("isLongText") or retweeted.get("pic_num", 0) > 9)
+    
+            if is_long_rt:
+                retweet = self.get_long_weibo(retweet_id) or self.parse_weibo(retweeted)
+            else:
+                retweet = self.parse_weibo(retweeted)
+
+            if retweet:
+                # 再做一次空值保护
                 weibo["retweet"] = retweet
-            else:  # 原创
-                if is_long:
-                    weibo = self.get_long_weibo(weibo_id)
-                    if not weibo:
-                        weibo = self.parse_weibo(weibo_info)
-                else:
-                    weibo = self.parse_weibo(weibo_info)
-            weibo["created_at"], weibo["full_created_at"] = self.standardize_date(
-                weibo_info["created_at"]
-            )
-            return weibo
-        except Exception as e:
-            logger.exception(e)
+
+        # 4. 最后标准化日期字段
+        created, full = self.standardize_date(mblog["created_at"])
+        weibo["created_at"] = created
+        weibo["full_created_at"] = full
+    
+        return weibo
+    
+        # except Exception as e:
+            # logger.exception(e)
 
     def get_weibo_comments(self, weibo, max_count, on_downloaded):
         """
